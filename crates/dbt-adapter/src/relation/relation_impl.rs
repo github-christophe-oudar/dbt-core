@@ -697,6 +697,14 @@ impl BaseRelation for Relation {
         }
     }
 
+    fn set_table_format(&mut self, table_format: Option<TableFormat>) {
+        if self.adapter_type == AdapterType::Snowflake
+            && let Some(table_format) = table_format
+        {
+            self.table_format = table_format;
+        }
+    }
+
     fn is_materialized_view(&self) -> bool {
         let result = matches!(self.relation_type, Some(RelationType::MaterializedView));
         result
@@ -990,7 +998,12 @@ impl BaseRelation for Relation {
     }
 
     fn normalize_component(&self, component: &str) -> String {
-        crate::format_ident::default_identifier_case(component, self.adapter_type)
+        use AdapterType::*;
+        match self.adapter_type {
+            Salesforce | Bigquery | ClickHouse => component.to_string(),
+            Snowflake => component.to_uppercase(),
+            _ => component.to_lowercase(),
+        }
     }
 
     fn render_self_as_str(&self) -> String {

@@ -5,8 +5,11 @@ use std::sync::Arc;
 use adbc_core::options::{OptionStatement, OptionValue};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
-use dbt_adapter_sql::statements::is_update_statement;
+use dbt_adapter_sql::statements::{
+    bigquery_statement_type_returns_rows, is_update_statement, statement_returns_result_rows,
+};
 use dbt_adbc::bigquery::QUERY_LABELS;
+use dbt_adbc::bigquery::schema_metadata as bq_schema_metadata;
 use dbt_adbc::{Backend, Connection, QueryCtx, Statement};
 use dbt_auth::AdapterConfig;
 use dbt_common::behavior_flags::Behavior;
@@ -19,6 +22,7 @@ use dbt_common::{AdapterError, AdapterErrorKind, AdapterResult, Cancellable, cre
 use dbt_schemas::schemas::common::ResolvedQuoting;
 use dbt_sql_utils::snowflake_terminal_flow_statement;
 use dbt_telemetry::{QueryExecuted, QueryOutcome};
+use dbt_tracked_stmt::TrackedStatement;
 use indexmap::IndexMap;
 use minijinja::State;
 use tracy_client::span;
@@ -26,6 +30,7 @@ use tracy_client::span;
 use crate::AdapterType;
 use crate::cache::RelationCache;
 use crate::engine::concat_batches::concat_batches_widened;
+use crate::engine::databricks_query_tags::query_tags_from_state;
 use crate::engine::query_comment::QueryCommentConfig;
 use crate::engine::sidecar_client::SidecarClient;
 use crate::errors::adbc_error_to_adapter_error;
@@ -194,6 +199,13 @@ pub trait AdapterEngine: Send + Sync {
         0
     }
 
+    /// Fingerprints the connection `config` would open, without opening one.
+    /// The pool reuses a connection only when this matches the connection's
+    /// own fingerprint; a mismatch forces a new connection.
+    fn fingerprint_for_config(&self, _config: &AdapterConfig) -> AdapterResult<u64> {
+        Ok(self.fingerprint())
+    }
+
     /// Get the physical execution backend for sidecar engines.
     ///
     /// Returns the actual database backend (DuckDB, Snowflake, etc.) that SQL
@@ -230,6 +242,34 @@ fn log_step_duration(label: &str, elapsed: std::time::Duration) {
     tracing::debug!("{label} took {elapsed:?}");
 }
 
+/// Skip draining the Arrow reader. BigQuery DML/DDL readers can Storage-Read
+/// the destination table (`dbt.run_query` on `INSERT` into a large table).
+/// Snowflake DML still needs the metadata row.
+pub(crate) fn skip_result_batch_consume(
+    adapter_type: AdapterType,
+    sql: &str,
+    schema: &Schema,
+    fetch: bool,
+) -> bool {
+    if schema.has_dml_columns(adapter_type) {
+        return false;
+    }
+    if !fetch {
+        return true;
+    }
+    match adapter_type {
+        AdapterType::Bigquery => {
+            if let Some(statement_type) = schema.metadata().get(bq_schema_metadata::STATEMENT_TYPE)
+            {
+                !bigquery_statement_type_returns_rows(statement_type)
+            } else {
+                !statement_returns_result_rows(sql, adapter_type)
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Default ADBC-based execute_with_options implementation.
 ///
 /// Used by engines whose connections implement the full ADBC protocol
@@ -261,27 +301,34 @@ pub(crate) fn adbc_execute_with_options(
 
     let adapter_type = engine.adapter_type();
     let mut options = options;
-    if let (Some(state), AdapterType::Bigquery) = (state, adapter_type) {
-        let mut job_labels = maybe_query_comment
-            .as_ref()
-            .map_or_else(IndexMap::new, |comment| {
-                engine
-                    .query_comment()
-                    .get_job_labels_from_query_comment(comment)
-            });
-        if let Some(invocation_id_label) = state
-            .lookup("invocation_id", &[])
-            .and_then(|value| value.as_str().map(|label| label.to_owned()))
-        {
-            job_labels.insert("dbt_invocation_id".to_string(), invocation_id_label);
+    match (state, adapter_type) {
+        (_, AdapterType::Databricks) => {
+            options.extend(query_tags_from_state(state)?.into_statement_options())
         }
+        (Some(state), AdapterType::Bigquery) => {
+            let mut job_labels =
+                maybe_query_comment
+                    .as_ref()
+                    .map_or_else(IndexMap::new, |comment| {
+                        engine
+                            .query_comment()
+                            .get_job_labels_from_query_comment(comment)
+                    });
+            if let Some(invocation_id_label) = state
+                .lookup("invocation_id", &[])
+                .and_then(|value| value.as_str().map(|label| label.to_owned()))
+            {
+                job_labels.insert("dbt_invocation_id".to_string(), invocation_id_label);
+            }
 
-        let job_label_option =
-            serde_json::to_string(&job_labels).expect("Should be able to serialize job labels");
-        options.push((
-            QUERY_LABELS.to_owned(),
-            OptionValue::String(job_label_option),
-        ));
+            let job_label_option =
+                serde_json::to_string(&job_labels).expect("Should be able to serialize job labels");
+            options.push((
+                QUERY_LABELS.to_owned(),
+                OptionValue::String(job_label_option),
+            ));
+        }
+        _ => {}
     }
 
     type ExecuteOutput = (Arc<Schema>, Vec<RecordBatch>, Option<i64>);
@@ -355,7 +402,7 @@ pub(crate) fn adbc_execute_with_options(
             return Ok((Arc::new(Schema::empty()), Vec::new(), rows_affected));
         }
 
-        // Alt compute: every statement compute_platform.rs sends is DDL/DML
+        // Lake compute: every statement compute_platform.rs sends is DDL/DML
         // whose result is never read (it always passes fetch=false -- models
         // only ever create/drop/write, they don't read query results back).
         // `stmt.execute()` below calls `reader.schema()` unconditionally, which
@@ -363,14 +410,35 @@ pub(crate) fn adbc_execute_with_options(
         // + list_files, ~2-3s) even though nothing will ever consume that
         // export. `execute_update()` skips export setup server-side entirely
         // and never touches the schema. This is only safe because dbt-compute
-        // doesn't execute tests today (see AltCompute routing in
+        // doesn't execute tests today (see `selects_lake_compute` routing in
         // dbt-tasks-sa/src/task.rs, keyed off the models table) -- a test
-        // needs its result rows, so a future test-execution path over Alt must
+        // needs its result rows, so a future test-execution path over lake compute must
         // pass fetch=true and must not hit this branch.
-        if adapter_type == AdapterType::Alt && !fetch {
+        if adapter_type == AdapterType::LakeCompute && !fetch {
             let rows_affected = stmt.execute_update()?;
             token.check_cancellation()?;
-            return Ok((Arc::new(Schema::empty()), Vec::new(), rows_affected));
+            // Surface non-fatal backend warnings (e.g. an export-limit
+            // truncation notice) via schema metadata, since this function's
+            // return type has no other slot for statement-level side
+            // channels. `AdapterResponse::from_record_batch` reads it back.
+            let warnings = stmt
+                .get_option_string(OptionStatement::Other(
+                    dbt_adbc::lake_compute::LAST_WARNINGS.to_string(),
+                ))
+                .unwrap_or_default();
+            let schema = if warnings.is_empty() {
+                Arc::new(Schema::empty())
+            } else {
+                let metadata = std::collections::HashMap::from([(
+                    dbt_adbc::lake_compute::schema_metadata::WARNINGS.to_string(),
+                    warnings,
+                )]);
+                Arc::new(Schema::new_with_metadata(
+                    Vec::<arrow_schema::Field>::new(),
+                    metadata,
+                ))
+            };
+            return Ok((schema, Vec::new(), rows_affected));
         }
 
         // Redshift-only: other adapters need execute()'s schema metadata
@@ -392,10 +460,41 @@ pub(crate) fn adbc_execute_with_options(
         log_step_duration("reader.schema()", t_schema.elapsed());
         let mut batches = Vec::with_capacity(1);
 
+        // Surface non-fatal backend warnings (e.g. an export-limit truncation
+        // notice) the same way the `!fetch` lake compute branch above does: via schema
+        // metadata, since this closure's return type has no other slot for
+        // statement-level side channels. `stmt.execute()` (quack's
+        // `ComputeStatement::do_execute`) already stashed them internally, so
+        // this is a local option read, not a second round trip -- but it must
+        // happen after `reader` (which holds `stmt` borrowed) is dropped.
+        let attach_alt_warnings = |stmt: &TrackedStatement, schema: Arc<Schema>| {
+            if adapter_type != AdapterType::LakeCompute {
+                return schema;
+            }
+            let warnings = stmt
+                .get_option_string(OptionStatement::Other(
+                    dbt_adbc::lake_compute::LAST_WARNINGS.to_string(),
+                ))
+                .unwrap_or_default();
+            if warnings.is_empty() {
+                return schema;
+            }
+            let mut metadata = schema.metadata().clone();
+            metadata.insert(
+                dbt_adbc::lake_compute::schema_metadata::WARNINGS.to_string(),
+                warnings,
+            );
+            Arc::new(Schema::new_with_metadata(schema.fields().clone(), metadata))
+        };
+
         // Snowflake DML (MERGE/INSERT/UPDATE/DELETE) returns a one-row metadata batch
         // with columns like "number of rows inserted". AdapterResponse needs that batch
         // to compute rows_affected correctly, so we must drain even when fetch=false.
-        if !fetch && !schema.has_dml_columns(engine.adapter_type()) {
+        // BigQuery DML/DDL readers can Storage-Read the destination table; skip that
+        // drain even when fetch=true (e.g. `dbt.run_query` on `INSERT`).
+        if skip_result_batch_consume(engine.adapter_type(), sql.as_ref(), &schema, fetch) {
+            drop(reader);
+            let schema = attach_alt_warnings(&stmt, schema);
             return Ok((schema, batches, None));
         }
 
@@ -410,6 +509,7 @@ pub(crate) fn adbc_execute_with_options(
             token.check_cancellation()?;
         }
         log_step_duration("batch-consume loop (for res in reader)", t_loop.elapsed());
+        let schema = attach_alt_warnings(&stmt, schema);
         Ok((schema, batches, None))
     };
     let _span = span!("SqlEngine::execute");
@@ -671,5 +771,71 @@ mod tests {
             uppercase_constraint_batch(),
         );
         assert_eq!(batch.schema().field(0).name(), "COLUMN_NAME");
+    }
+
+    fn schema_with_bq_statement_type(statement_type: &str) -> Schema {
+        Schema::new_with_metadata(
+            vec![Field::new("compiled_code", DataType::Utf8, true)],
+            std::collections::HashMap::from([(
+                bq_schema_metadata::STATEMENT_TYPE.to_string(),
+                statement_type.to_string(),
+            )]),
+        )
+    }
+
+    #[test]
+    fn skip_result_batch_consume_skips_bigquery_insert_even_when_fetch_true() {
+        let schema = Schema::empty();
+        let sql = "/* metadata */\nINSERT INTO t VALUES (1)";
+        assert!(skip_result_batch_consume(
+            AdapterType::Bigquery,
+            sql,
+            &schema,
+            true,
+        ));
+    }
+
+    #[test]
+    fn skip_result_batch_consume_uses_bigquery_statement_type_metadata() {
+        let insert_schema = schema_with_bq_statement_type("INSERT");
+        assert!(skip_result_batch_consume(
+            AdapterType::Bigquery,
+            "SELECT 1",
+            &insert_schema,
+            true,
+        ));
+        let select_schema = schema_with_bq_statement_type("SELECT");
+        assert!(!skip_result_batch_consume(
+            AdapterType::Bigquery,
+            "INSERT INTO t VALUES (1)",
+            &select_schema,
+            true,
+        ));
+    }
+
+    #[test]
+    fn skip_result_batch_consume_still_fetches_bigquery_select() {
+        let schema = Schema::empty();
+        assert!(!skip_result_batch_consume(
+            AdapterType::Bigquery,
+            "SELECT 1",
+            &schema,
+            true,
+        ));
+    }
+
+    #[test]
+    fn skip_result_batch_consume_does_not_skip_snowflake_dml_metadata() {
+        let schema = Schema::new(vec![Field::new(
+            "number of rows inserted",
+            DataType::Int64,
+            false,
+        )]);
+        assert!(!skip_result_batch_consume(
+            AdapterType::Snowflake,
+            "INSERT INTO t VALUES (1)",
+            &schema,
+            false,
+        ));
     }
 }

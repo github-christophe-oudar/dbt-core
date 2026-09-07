@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use dbt_common::FsResult;
 use dbt_yaml::{DbtSchema, UntaggedEnumDeserialize};
@@ -50,9 +50,11 @@ pub struct DbtColumn {
     pub tags: Vec<String>,
     pub policy_tags: Option<Vec<StringOrMap>>,
     pub classifiers: Option<Vec<String>>,
-    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+    pub databricks_tags: Option<IndexMap<String, YmlValue>>,
     pub column_mask: Option<ColumnMask>,
     pub quote: Option<bool>,
+    pub codec: Option<String>,
+    pub ttl: Option<String>,
     #[serde(default, rename = "config")]
     pub deprecated_config: ColumnConfig,
     pub dimension: Option<ColumnPropertiesDimension>,
@@ -124,9 +126,11 @@ pub struct ColumnProperties {
     #[serde(default, deserialize_with = "policy_tags_from_scalar_or_list")]
     pub policy_tags: Option<Vec<StringOrMap>>,
     pub classifiers: Option<Vec<String>>,
-    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+    pub databricks_tags: Option<IndexMap<String, YmlValue>>,
     pub column_mask: Option<ColumnMask>,
     pub quote: Option<bool>,
+    pub codec: Option<String>,
+    pub ttl: Option<String>,
     pub config: Option<ColumnConfig>,
 
     pub entity: Option<Entity>,
@@ -152,9 +156,11 @@ pub struct VersionColumnProperties {
     #[serde(default, deserialize_with = "policy_tags_from_scalar_or_list")]
     pub policy_tags: Option<Vec<StringOrMap>>,
     pub classifiers: Option<Vec<String>>,
-    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+    pub databricks_tags: Option<IndexMap<String, YmlValue>>,
     pub column_mask: Option<ColumnMask>,
     pub quote: Option<bool>,
+    pub codec: Option<String>,
+    pub ttl: Option<String>,
     pub config: Option<ColumnConfig>,
     pub entity: Option<Entity>,
     pub dimension: Option<ColumnPropertiesDimension>,
@@ -181,6 +187,8 @@ impl VersionColumnProperties {
             databricks_tags: self.databricks_tags.clone(),
             column_mask: self.column_mask.clone(),
             quote: self.quote,
+            codec: self.codec.clone(),
+            ttl: self.ttl.clone(),
             config: self.config.clone(),
             entity: self.entity.clone(),
             dimension: self.dimension.clone(),
@@ -217,7 +225,7 @@ pub struct ColumnConfig {
     #[serde(default)]
     pub tags: Option<StringOrArrayOfStrings>,
     pub meta: Option<IndexMap<String, YmlValue>>,
-    pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
+    pub databricks_tags: Option<IndexMap<String, YmlValue>>,
     #[serde(default, deserialize_with = "policy_tags_from_scalar_or_list")]
     pub policy_tags: Option<Vec<StringOrMap>>,
 }
@@ -364,6 +372,8 @@ pub fn process_columns(
                     databricks_tags: cp.databricks_tags.clone().or(cp_databricks_tags),
                     column_mask: cp.column_mask.clone(),
                     quote: cp.quote,
+                    codec: cp.codec.clone(),
+                    ttl: cp.ttl.clone(),
                     deprecated_config: cp.config.clone().unwrap_or_default(),
                     dimension: normalize_dimension(
                         cp.dimension.clone(),
@@ -403,6 +413,8 @@ mod tests {
             databricks_tags: None,
             column_mask: None,
             quote: None,
+            codec: None,
+            ttl: None,
             config: None,
             entity: None,
             dimension: None,
@@ -461,6 +473,22 @@ mod tests {
             }
             other => panic!("expected DimensionConfig, got {other:?}"),
         }
+    }
+
+    /// ClickHouse `codec:`/`ttl:` on a schema.yml column must survive into
+    /// `DbtColumn` — contract DDL rendering and schema_changes read them there.
+    #[test]
+    fn test_process_columns_preserves_codec_and_ttl() {
+        let mut col = make_col("col_3", "Compressed column.");
+        col.codec = Some("ZSTD".to_string());
+        col.ttl = Some("created_at + INTERVAL 1 DAY".to_string());
+
+        let result = process_columns(Some(&vec![col]), None, None).unwrap();
+        assert_eq!(result[0].codec.as_deref(), Some("ZSTD"));
+        assert_eq!(
+            result[0].ttl.as_deref(),
+            Some("created_at + INTERVAL 1 DAY")
+        );
     }
 
     /// Bare-string `dimension: time` must pass through untouched — dbt-core

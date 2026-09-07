@@ -28,6 +28,7 @@ use crate::schemas::semantic_layer::semantic_manifest::SemanticLayerElementConfi
 use super::relations::base::ComponentName;
 use super::serde::{
     StringOrArrayOfStrings, bool_or_string_bool, bool_or_string_bool_default, i64_or_string_i64,
+    yaml_11_bool_default,
 };
 
 /// Indicates where schema metadata originates from.
@@ -398,23 +399,6 @@ impl<T: Clone + Merge<T>> Merge<Option<T>> for Option<T> {
     }
 }
 
-/// Selects the compute target a model's DML is executed against.
-///
-/// `Default` uses the profile's adapter. A run implementation may honor an
-/// alternate target for other variants; parse/compile/render and introspection
-/// are unaffected by this selection.
-#[derive(
-    Default, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, EnumIter, Eq, DbtSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ComputePlatform {
-    /// Execute on the profile's (default) adapter.
-    #[default]
-    Default,
-    /// Execute on the alternate compute target.
-    Alt,
-}
-
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, EnumIter, Eq, DbtSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DbtMaterialization {
@@ -684,6 +668,24 @@ impl DbtQuoting {
         self.schema = self.schema.or(other.schema);
     }
 
+    /// A copy of `self` with every field it leaves unset taken from `fallback`.
+    ///
+    /// The layering primitive for quoting precedence: apply it once per layer,
+    /// most specific first, and the first layer to set a field wins. Unlike
+    /// [`Self::default_to`] this carries `snowflake_ignore_case` too, so a layer
+    /// that sets only that field is not silently dropped.
+    #[must_use]
+    pub fn filled_from(&self, fallback: &DbtQuoting) -> DbtQuoting {
+        DbtQuoting {
+            database: self.database.or(fallback.database),
+            schema: self.schema.or(fallback.schema),
+            identifier: self.identifier.or(fallback.identifier),
+            snowflake_ignore_case: self
+                .snowflake_ignore_case
+                .or(fallback.snowflake_ignore_case),
+        }
+    }
+
     /// Shallow last-non-None-wins merge of two user-supplied quoting layers.
     /// Returns `None` only when both inputs are `None` so callers can preserve
     /// "user set nothing" on the manifest (no adapter defaults folded in).
@@ -787,9 +789,12 @@ pub enum DbtBatchSize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, DbtSchema)]
 pub struct DbtContract {
-    #[serde(default = "default_alias_types")]
+    #[serde(
+        default = "default_alias_types",
+        deserialize_with = "yaml_11_bool_default"
+    )]
     pub alias_types: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "yaml_11_bool_default")]
     pub enforced: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<YmlValue>,
@@ -1182,7 +1187,7 @@ pub enum Rows {
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, DbtSchema)]
 pub struct DocsConfig {
-    #[serde(default = "default_show")]
+    #[serde(default = "default_show", deserialize_with = "yaml_11_bool_default")]
     pub show: bool,
     pub node_color: Option<String>,
 }
@@ -1203,12 +1208,14 @@ fn default_show() -> bool {
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default, DbtSchema)]
 pub struct PersistDocsConfig {
+    #[serde(deserialize_with = "bool_or_string_bool", default)]
     pub columns: Option<bool>,
+    #[serde(deserialize_with = "bool_or_string_bool", default)]
     pub relation: Option<bool>,
 }
 
 #[skip_serializing_none]
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, DbtSchema)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, DbtSchema, Default)]
 pub struct ScheduleConfig {
     pub cron: Option<String>,
     pub time_zone_value: Option<String>,
@@ -1236,6 +1243,13 @@ impl Schedule {
             Schedule::ScheduleConfig(config) => config.clone(),
         }
     }
+}
+
+#[skip_serializing_none]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, DbtSchema)]
+pub struct RowFilterConfig {
+    pub function: Option<String>,
+    pub columns: Option<StringOrArrayOfStrings>,
 }
 
 #[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, PartialEq, Eq, DbtSchema)]
@@ -1421,6 +1435,12 @@ where
         None => Vec::new(),
     };
     normalized.serialize(serializer)
+}
+
+// `skip_serializing_none` only rewrites fields whose declared outer type is
+// `Option`, so it cannot elide a field through a `Verbatim` wrapper.
+pub fn verbatim_option_is_none<T>(value: &Verbatim<Option<T>>) -> bool {
+    value.is_none()
 }
 
 #[skip_serializing_none]
@@ -1752,17 +1772,16 @@ pub fn conform_normalized_snapshot_raw_code_to_mantle_format(normalized_full: &s
     let sql_without_opening = find_opening(normalized_full)
         .and_then(|start_pos| {
             let after_tag_start = &normalized_full[start_pos..];
+            // Scoped to this tag's own boundary: the *nearest* `%}` after
+            // `start_pos` always closes this tag, dashed or not, because a
+            // snapshot name is a bare identifier that can't itself contain
+            // `%}`. Searching for `-%}` first (as before) would skip past
+            // this tag's own plain `%}` and match a later, unrelated inner
+            // tag's dashed close instead (e.g. `{% snapshot foo %} ...
+            // {% for x in y -%}`), stripping real body content.
             after_tag_start
-                .find("-%}")
-                .or_else(|| after_tag_start.find("%}"))
-                .map(|end_offset| {
-                    let tag_end = if after_tag_start[end_offset..].starts_with("-%}") {
-                        end_offset + 3
-                    } else {
-                        end_offset + 2
-                    };
-                    &normalized_full[start_pos + tag_end..]
-                })
+                .find("%}")
+                .map(|end_offset| &normalized_full[start_pos + end_offset + 2..])
         })
         .unwrap_or(normalized_full);
 
@@ -2202,6 +2221,31 @@ exclude: 3
             conform_normalized_snapshot_raw_code_to_mantle_format(already),
             already,
             "already-stripped input should be returned unchanged"
+        );
+    }
+
+    #[test]
+    fn test_conform_normalized_snapshot_dashed_inner_tag_does_not_leak_into_opening_strip() {
+        // Regression for dbt-labs/dbt-core#15956 (FUSCSE-58): a plain outer
+        // `{% snapshot %}` tag combined with any inner whitespace-controlled tag
+        // caused the opening-tag boundary search to skip past this tag's own
+        // nearby `%}` and match the inner tag's dashed close instead, silently
+        // dropping real body content before hashing and falsely flagging
+        // unchanged snapshots as `state:modified.body`.
+        let trigger = "{% snapshot repro %} select {% for c in cols -%} {{ c }}{%- if not loop.last %},{%- endif -%} {%- endfor %} from t {% endsnapshot %}";
+        let control = "{%- snapshot repro -%} select {% for c in cols -%} {{ c }}{%- if not loop.last %},{%- endif -%} {%- endfor %} from t {%- endsnapshot -%}";
+
+        let stripped_trigger = conform_normalized_snapshot_raw_code_to_mantle_format(trigger);
+        let stripped_control = conform_normalized_snapshot_raw_code_to_mantle_format(control);
+
+        assert!(
+            stripped_trigger.contains("select") && stripped_trigger.contains("from t"),
+            "body content before/after the inner dashed tag must survive stripping, got: {stripped_trigger:?}"
+        );
+        assert_eq!(
+            stripped_trigger, stripped_control,
+            "plain and dashed outer tags must normalize to the same stripped body; \
+             the previous bug made these diverge, causing a false state:modified.body"
         );
     }
 
@@ -2968,5 +3012,50 @@ period: hour
     #[test]
     fn test_normalize_deprecation_date_unparseable_passes_through() {
         assert_eq!(normalize_deprecation_date("not-a-date"), "not-a-date");
+    }
+
+    /// PyYAML (and so dbt-core) resolves the YAML 1.1 boolean tokens that Fusion's YAML 1.2
+    /// reader hands to serde as strings. `yes` must resolve to `true`, and a token outside the
+    /// set must still error rather than silently become `false`.
+    #[test]
+    fn test_dbt_contract_resolves_yaml_11_boolean_tokens() {
+        for field in ["enforced", "alias_types"] {
+            for (token, expected) in [
+                ("no", false),
+                ("No", false),
+                ("off", false),
+                ("false", false),
+                ("yes", true),
+                ("on", true),
+                ("true", true),
+            ] {
+                let contract: DbtContract =
+                    dbt_yaml::from_str(&format!("{field}: {token}\n")).unwrap();
+                let resolved = match field {
+                    "enforced" => contract.enforced,
+                    _ => contract.alias_types,
+                };
+                assert_eq!(resolved, expected, "{field}: {token}");
+            }
+
+            for token in ["maybe", "1"] {
+                let result: Result<DbtContract, _> =
+                    dbt_yaml::from_str(&format!("{field}: {token}\n"));
+                assert!(result.is_err(), "{field}: {token}");
+            }
+        }
+    }
+
+    /// `docs: { show: no }` is the same YAML 1.1 boolean divergence as `contract.enforced`;
+    /// `show` defaults to `true`, so a silently wrong value would be invisible.
+    #[test]
+    fn test_docs_config_show_resolves_yaml_11_boolean_tokens() {
+        for (token, expected) in [("no", false), ("off", false), ("yes", true), ("on", true)] {
+            let docs: DocsConfig = dbt_yaml::from_str(&format!("show: {token}\n")).unwrap();
+            assert_eq!(docs.show, expected, "token: {token}");
+        }
+
+        let result: Result<DocsConfig, _> = dbt_yaml::from_str("show: maybe\n");
+        assert!(result.is_err());
     }
 }
